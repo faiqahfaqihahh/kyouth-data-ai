@@ -1,63 +1,66 @@
-import sys
-import logging
-
+from pathlib import Path # This import to help us handle file paths in a platform-independent way
+import sys 
 from src.ingestor import ingest_all_mhtml
 from src.processor import process_all_html
 from src.loader import load_all_jsons
 from src.profiler import run_data_profile
+import logging
 
-# ── Logging configuration ─────────────────────────────────────────────────────
+SOURCE_DIR = Path("data/0_source")
+BRONZE_DIR = Path("data/1_bronze")
+SILVER_DIR = Path("data/2_silver")
+GOLD_DIR = Path("data/3_gold")
+DB_NAME = "jobs.db"
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    format="%(asctime)s |%(levelname)s |%(message)s"
 )
 
-# ── Directory / path constants ────────────────────────────────────────────────
-SOURCE_DIR = "data/0_source"
-BRONZE_DIR = "data/1_bronze"
-SILVER_DIR = "data/2_silver"
-GOLD_DIR   = "data/3_gold"
-DB_PATH    = "data/3_gold/jobs.db"
+def run_profiler():
+    db_path = GOLD_DIR/DB_NAME
+    run_data_profile(db_path)
+
+def run_gold():
+    input_dir = SILVER_DIR
+    output_dir = GOLD_DIR
+    load_all_jsons(input_dir, output_dir)
+
+def run_silver():
+    input_dir = BRONZE_DIR
+    output_dir = SILVER_DIR
+    process_all_html(input_dir, output_dir)
 
 
-def cmd_ingest():
-    ingest_all_mhtml(SOURCE_DIR, BRONZE_DIR)
+def run_bronze():
+    input_dir = SOURCE_DIR
+    output_dir = BRONZE_DIR
+    ingest_all_mhtml(input_dir, output_dir)
+    
+def main():
 
+    if len(sys.argv) < 2:
+        print("Usage: python main.py [ingest|process|load|profile|all]")
+        return
 
-def cmd_process():
-    process_all_html(BRONZE_DIR, SILVER_DIR)
+    command = sys.argv[1]
 
+    if command == "ingest":
+        run_bronze()
+    elif command == "process":
+        run_silver()
+    elif command == "load":
+        run_gold()
+    elif command == "profile":
+        run_profiler()
+    elif command == "all":
+        run_bronze()
+        run_silver()
+        run_gold()
+        run_profiler()
+    else:
+        print("Usage: python main.py [ingest|process|load|profile|all]")
 
-def cmd_load():
-    load_all_jsons(SILVER_DIR, GOLD_DIR)
-
-
-def cmd_profile():
-    run_data_profile(DB_PATH)
-
-
-def cmd_all():
-    cmd_ingest()
-    print()
-    cmd_process()
-    print()
-    cmd_load()
-    print()
-    cmd_profile()
-
-
-COMMANDS = {
-    "ingest":  cmd_ingest,
-    "process": cmd_process,
-    "load":    cmd_load,
-    "profile": cmd_profile,
-    "all":     cmd_all,
-}
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
-        print("Usage: python main.py [ingest|process|load|profile|all]")
-        sys.exit(0)
-
-    COMMANDS[sys.argv[1]]()
+    main()
