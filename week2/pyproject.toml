@@ -1,0 +1,13 @@
+[project]
+name = "week-2"
+version = "0.1.0"
+description = "LLM tooling – prompt models, data tagging, skill gap analysis"
+requires-python = ">=3.11"
+
+dependencies = [
+    "requests>=2.28",
+    "google-genai>=1.0",
+    "pydantic>=2.0",
+    "python-dotenv>=1.0",
+]
+
