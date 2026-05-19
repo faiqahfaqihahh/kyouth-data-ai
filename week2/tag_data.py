@@ -1,199 +1,190 @@
 """
 tag_data.py
 
-Reads job rows from a SQLite database and uses an AI model to populate the
-tech_stack column with comma-separated technical skills extracted from the
-job description.  Processes rows in batches for efficiency.
+Reads untagged job rows from a SQLite database and uses Google Gemini to
+populate the tech_stack column with comma-separated technical skills.
 
 Usage:
     uv run tag_data.py
-    uv run tag_data.py data/jobs_d1.db          # custom DB path
+    uv run tag_data.py data/jobs_d1.db
 """
 
+import os
 import sys
 import time
-import json
 import sqlite3
-import os
+import json
+from typing import List
+from pydantic import BaseModel
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── configuration ─────────────────────────────────────────────────────────────
-DEFAULT_DB = "data/resources/jobs_d1.db"
-BATCH_SIZE  = 5          # number of jobs sent to the model in one request
-RETRY_LIMIT = 3          # how many times to retry a failed batch
-RETRY_DELAY = 2          # seconds to wait between retries
 
-# We use gemini-2.5-flash-lite (free, low latency) for tagging.
-# Change to any model from prompt_model.py if you prefer.
-TAGGING_MODEL = "gemini-2.5-flash-lite"
+# ── Pydantic models ───────────────────────────────────────────────────────────
+
+class JobTag(BaseModel):
+    source_id: str
+    tech_stack: str
+
+
+class BatchTagResult(BaseModel):
+    jobs: List[JobTag]
+
+
+# ── configuration ─────────────────────────────────────────────────────────────
+
+BATCH_SIZE   = 5     # jobs per API call
+MAX_ATTEMPTS = 3     # retries per batch
+RETRY_DELAY  = 2     # seconds between retries
+MODEL        = "gemini-2.5-flash"
+
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-def _get_gemini_client():
+def _get_client():
+    """Return a Gemini client, or raise RuntimeError with a clean message."""
     from google import genai
-    api_key = os.getenv("GOOGLE_API_KEY")
+    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        raise RuntimeError("GOOGLE_API_KEY not set in environment / .env file")
+        raise RuntimeError(
+            "API key not found. Set GOOGLE_API_KEY in your .env file."
+        )
     return genai.Client(api_key=api_key)
 
 
-def _build_prompt(batch: list[dict]) -> str:
+def _build_prompt(batch_data: list[dict]) -> str:
+    """Compact prompt – key token-saving choices:
+    - one-sentence role description
+    - data inlined as JSON (no per-job repetition of instructions)
+    - output schema stated once by example
     """
-    Build a compact prompt asking the model to extract tech stacks.
-    Returns a JSON array so we can parse it reliably.
-    """
-    jobs_text = "\n\n".join(
-        f"JOB_ID: {row['source_id']}\nDESCRIPTION: {row['description'][:1200]}"
-        for row in batch
-    )
     return (
-        "You are a technical recruiter assistant. "
-        "For each job below, list ONLY the technical skills / technologies mentioned "
-        "(programming languages, frameworks, tools, cloud platforms, databases, etc.). "
-        "Do NOT include soft skills, certifications, or job titles. "
-        "Return ONLY a valid JSON array of objects with keys 'job_id' and 'tech_stack' "
-        "(tech_stack is a comma-separated string). No markdown, no explanation.\n\n"
-        + jobs_text
+        "Extract technical stack for each job. "
+        "Return ONLY valid JSON: {\"jobs\":[{\"source_id\":\"...\",\"tech_stack\":\"skill1, skill2\"},...]}. "
+        "No markdown, no explanation.\n\n"
+        f"Jobs: {json.dumps(batch_data)}"
     )
-
-
-def _parse_response(text: str, batch: list[dict]) -> dict[str, str]:
-    """Parse the model JSON response into {job_id: tech_stack} mapping."""
-    # Strip possible markdown fences
-    clean = text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-    parsed = json.loads(clean)          # raises json.JSONDecodeError on bad JSON
-    result = {}
-    for item in parsed:
-        jid  = str(item.get("job_id", "")).strip()
-        tech = str(item.get("tech_stack", "")).strip()
-        if jid:
-            result[jid] = tech
-    # Validate we got an entry for every job in the batch
-    if len(result) != len(batch):
-        raise ValueError(
-            f"Mismatch between batch size ({len(batch)}) and response ({len(result)})"
-        )
-    return result
-
-
-def _call_model(prompt: str) -> tuple[str, int, int]:
-    """
-    Call the Gemini model.  Returns (response_text, input_tokens, output_tokens).
-    """
-    from google import genai
-    client = _get_gemini_client()
-    response = client.models.generate_content(
-        model=TAGGING_MODEL,
-        contents=prompt,
-    )
-    text = response.text or ""
-    # Token counts (Gemini returns these in usage_metadata)
-    try:
-        in_tok  = response.usage_metadata.prompt_token_count     or 0
-        out_tok = response.usage_metadata.candidates_token_count or 0
-    except Exception:
-        # Fallback: estimate 4 tokens per word
-        in_tok  = len(prompt.split()) * 4
-        out_tok = len(text.split())   * 4
-    return text, in_tok, out_tok
 
 
 # ── main function ─────────────────────────────────────────────────────────────
 
 def tag_data(db_url: str) -> tuple[int, float]:
     """
-    Populate the tech_stack column for all jobs that currently have NULL / empty
-    tech_stack values.
+    Populate the tech_stack column for all untagged jobs.
 
     Parameters
     ----------
     db_url : str  – path to the SQLite database file
 
-    Returns
-    -------
-    (total_tokens_used, elapsed_ms) – bonus return values
+    Returns (total_tokens_used, elapsed_ms)
     """
-    start_ms = time.time()
+    start = time.time()
     total_tokens = 0
 
+    # ── connect to DB ─────────────────────────────────────────────────────────
     try:
         if not os.path.exists(db_url):
-            print(f"[DB Error] Database file not found: '{db_url}'", file=sys.stderr)
-            print("  → Make sure jobs_d1.db is in the data/ folder.", file=sys.stderr)
+            print(f"[Error] Database file not found: '{db_url}'", file=sys.stderr)
             return 0, 0.0
         conn = sqlite3.connect(db_url)
-        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
     except Exception as e:
-        print(f"[DB Error] Cannot open database '{db_url}': {e}", file=sys.stderr)
+        print(f"[DB Error] Cannot open '{db_url}': {e}", file=sys.stderr)
         return 0, 0.0
 
+    # ── fetch untagged rows ───────────────────────────────────────────────────
     try:
-        cur = conn.cursor()
-        # Fetch all rows that still need tagging
-        cur.execute(
+        cursor.execute(
             "SELECT source_id, description FROM jobs "
             "WHERE tech_stack IS NULL OR tech_stack = ''"
         )
-        rows = [dict(r) for r in cur.fetchall()]
-
-        if not rows:
-            elapsed = (time.time() - start_ms) * 1000
-            print("No data to tag")
-            print(f"Total tokens used: 0, took {elapsed:.3f}ms")
-            conn.close()
-            return 0, elapsed
-
-        # Process in batches
-        for batch_idx in range(0, len(rows), BATCH_SIZE):
-            batch = rows[batch_idx: batch_idx + BATCH_SIZE]
-            prompt = _build_prompt(batch)
-
-            result_map = None
-            for attempt in range(1, RETRY_LIMIT + 1):
-                try:
-                    text, in_tok, out_tok = _call_model(prompt)
-                    total_tokens += in_tok + out_tok
-                    result_map = _parse_response(text, batch)
-                    break   # success
-                except (json.JSONDecodeError, ValueError) as e:
-                    print(f"[Batch {batch_idx // BATCH_SIZE}] Attempt {attempt} failed: {e}")
-                    if attempt < RETRY_LIMIT:
-                        time.sleep(RETRY_DELAY)
-                except Exception as e:
-                    print(f"[Batch {batch_idx // BATCH_SIZE}] Attempt {attempt} error: {e}")
-                    if attempt < RETRY_LIMIT:
-                        time.sleep(RETRY_DELAY)
-
-            if result_map is None:
-                print(f"[Batch {batch_idx // BATCH_SIZE}] Skipping after {RETRY_LIMIT} failed attempts")
-                continue
-
-            # Write results to DB
-            for job in batch:
-                jid  = str(job["source_id"])
-                tech = result_map.get(jid, "")
-                if tech:
-                    cur.execute(
-                        "UPDATE jobs SET tech_stack = ? WHERE source_id = ?",
-                        (tech, jid),
-                    )
-                    print(f"Analyzed Job {jid}: {tech}")
-
-            conn.commit()
-
+        untagged = cursor.fetchall()
     except Exception as e:
-        print(f"[Unexpected Error] {e}", file=sys.stderr)
-    finally:
+        print(f"[DB Error] Cannot query jobs: {e}", file=sys.stderr)
         conn.close()
+        return 0, 0.0
 
-    elapsed = (time.time() - start_ms) * 1000
+    if not untagged:
+        elapsed = (time.time() - start) * 1000
+        print("No data to tag")
+        print(f"Total tokens used: 0, took {elapsed:.3f}ms")
+        conn.close()
+        return 0, elapsed
+
+    # ── get Gemini client (once, fail fast with clean message) ────────────────
+    try:
+        from google.genai import types
+        client = _get_client()
+    except Exception as e:
+        print(f"[Error] {e}", file=sys.stderr)
+        conn.close()
+        return 0, 0.0
+
+    # ── process in batches ────────────────────────────────────────────────────
+    for batch_idx in range(0, len(untagged), BATCH_SIZE):
+        batch = untagged[batch_idx: batch_idx + BATCH_SIZE]
+        batch_data = [{"source_id": row[0], "description": row[1][:900]} for row in batch]
+        prompt = _build_prompt(batch_data)
+
+        result: BatchTagResult | None = None
+
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            try:
+                response = client.models.generate_content(
+                    model=MODEL,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=BatchTagResult,
+                        temperature=0.0,
+                    ),
+                )
+
+                # Token counting
+                if response.usage_metadata:
+                    total_tokens += response.usage_metadata.total_token_count or 0
+                else:
+                    total_tokens += len(prompt.split()) * 4 + len(response.text.split()) * 4
+
+                parsed = BatchTagResult.model_validate_json(response.text)
+
+                if len(parsed.jobs) != len(batch):
+                    raise ValueError(
+                        f"Mismatch between batch size ({len(batch)}) and response ({len(parsed.jobs)})"
+                    )
+
+                result = parsed
+                break  # success
+
+            except Exception as e:
+                print(f"[Batch {batch_idx // BATCH_SIZE}] Attempt {attempt} failed: {e}")
+                if attempt < MAX_ATTEMPTS:
+                    time.sleep(RETRY_DELAY)
+
+        if result is None:
+            print(f"[Batch {batch_idx // BATCH_SIZE}] Skipping after {MAX_ATTEMPTS} failed attempts")
+            continue
+
+        # Write to DB
+        for tagged in result.jobs:
+            if tagged.tech_stack:
+                cursor.execute(
+                    "UPDATE jobs SET tech_stack = ? WHERE source_id = ?",
+                    (tagged.tech_stack, tagged.source_id),
+                )
+                print(f"Analyzed Job {tagged.source_id}: {tagged.tech_stack}")
+
+        conn.commit()
+
+    conn.close()
+    elapsed = (time.time() - start) * 1000
     print(f"\nTotal tokens used: {total_tokens}, took {elapsed:.3f}ms")
     return total_tokens, elapsed
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    db_path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_DB
+    db_path = sys.argv[1] if len(sys.argv) > 1 else "data/jobs_d1.db"
     tag_data(db_path)
