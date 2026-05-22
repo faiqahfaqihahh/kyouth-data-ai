@@ -1,233 +1,200 @@
-"""
-find_skill_gaps.py
-
-Reads a resume text file, queries the tagged jobs database, and returns
-the technical skills present in the job market that the resume is missing.
-
-Determinism strategy:
-  - temperature=0 on every Gemini call
-  - Structured JSON output via response_schema (no free-text parsing)
-  - All output sorted + lowercased before returning
-
-Usage:
-    uv run find_skill_gaps.py
-    uv run find_skill_gaps.py data/resume.txt data/jobs_d1.db
-"""
-
-import os
-import sys
-import re
-import time
-import sqlite3
+import asyncio
 import json
-from typing import List
-from pydantic import BaseModel
+import re
+import sys
+import time
+import os
+
 from dotenv import load_dotenv
+from fastmcp import Client
+from fastmcp.client.transports import StdioTransport
+from pydantic import BaseModel
 
 load_dotenv()
 
-
-# ── Pydantic models ───────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Pydantic model
+# ---------------------------------------------------------------------------
 
 class SkillGapResult(BaseModel):
-    gaps: List[str]
-    tokens_used: int  = 0
-    elapsed_ms:  float = 0.0
-    # Bonus: demand statistics
-    skill_demand: dict = {}   # {skill: number_of_jobs_requiring_it}
-    top_demanded: List[str] = []  # top 5 gap skills by demand
+    gaps: list
+    total_skills_in_db: int = 0
+    resume_skills_found: int = 0
+    gap_count: int = 0
+    skill_frequency: dict = {}
+    top_5_missing: list = []
+    match_pct: float = 0.0
+    tokens: int = 0
+    time_ms: float = 0.0
 
 
-# ── configuration ─────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Jailbreak patterns
+# ---------------------------------------------------------------------------
 
-MODEL        = "gemini-2.5-flash"
-MAX_ATTEMPTS = 3
-RETRY_DELAY  = 1   # seconds
-
-
-# ── jailbreak / input sanitisation ────────────────────────────────────────────
-
-_JAILBREAK_PATTERNS = re.compile(
-    r"ignore\s+(all\s+)?previous\s+instructions"
-    r"|disregard\s+(your\s+)?instructions"
-    r"|you\s+are\s+now\s+(?:a\s+)?(?:dan|jailbreak|evil|unrestricted)"
-    r"|act\s+as\s+(?:if\s+you\s+(?:are|were)\s+)?(?:an?\s+)?(?:unrestricted|evil|jailbreak)"
-    r"|reveal\s+(your\s+)?(system\s+)?prompt"
-    r"|print\s+(your\s+)?(system\s+)?prompt"
-    r"|override\s+(your\s+)?(?:safety|guidelines|instructions)"
-    r"|do\s+anything\s+now"
-    r"|forget\s+(that\s+)?you\s+are",
-    re.IGNORECASE,
+_JAILBREAK_PATTERNS = [
+    r"ignore (previous|all|above|prior) instructions",
+    r"you are now",
+    r"disregard.*system",
+    r"act as (?!a (?:job|career|skill))",
+    r"forget.*rules",
+    r"new persona",
+    r"do anything now",
+    r"prompt injection",
+    r"override.*instructions",
+]
+_JAILBREAK_RE = re.compile(
+    "|".join(_JAILBREAK_PATTERNS), re.IGNORECASE | re.DOTALL
 )
 
-def _sanitise(text: str) -> str:
-    """Raise ValueError if jailbreak patterns detected; strip XML/code fences."""
-    if _JAILBREAK_PATTERNS.search(text):
-        raise ValueError("[Security] Jailbreak pattern detected in input. Aborting.")
-    # Remove system-prompt-style XML tags and markdown code fences
-    text = re.sub(r"<\s*/?system\s*>", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"```[\s\S]*?```", "", text)
-    return text.strip()
 
-
-# ── helpers ───────────────────────────────────────────────────────────────────
-
-def _get_client():
-    from google import genai
-    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("API key not found. Set GOOGLE_API_KEY in your .env file.")
-    return genai.Client(api_key=api_key)
-
-
-def _load_market_skills(db_url: str) -> tuple[list[str], dict[str, int]]:
-    """Return (sorted_unique_skills, {skill: job_count})."""
-    conn = sqlite3.connect(db_url)
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT tech_stack FROM jobs "
-            "WHERE tech_stack IS NOT NULL AND tech_stack != ''"
-        )
-        rows = cur.fetchall()
-    finally:
-        conn.close()
-
-    skill_count: dict[str, int] = {}
-    for (stack,) in rows:
-        for skill in stack.split(","):
-            s = skill.strip().lower()
-            if s:
-                skill_count[s] = skill_count.get(s, 0) + 1
-
-    return sorted(skill_count.keys()), skill_count
-
-
-# ── main function ─────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Main function
+# ---------------------------------------------------------------------------
 
 def find_skill_gaps(input_file_path: str, db_url: str) -> SkillGapResult:
-    """
-    Compare resume skills against the market and return what is missing.
+    """Sync entry point."""
+    return asyncio.run(_find_skill_gaps_async(input_file_path, db_url))
 
-    Parameters
-    ----------
-    input_file_path : str  – path to the resume .txt file
-    db_url          : str  – path to the SQLite database
 
-    Returns SkillGapResult with:
-      gaps         – sorted, lowercase list of missing skills
-      tokens_used  – total tokens consumed
-      elapsed_ms   – wall-clock time in ms
-      skill_demand – {skill: job_count} for each gap skill
-      top_demanded – top 5 gap skills by demand
-    """
-    start = time.time()
-    total_tokens = 0
+async def _find_skill_gaps_async(input_file_path: str, db_url: str) -> SkillGapResult:
+    start = time.perf_counter()
 
-    # 1. Read & sanitise resume
+    # 1. Load resume
     try:
-        with open(input_file_path, "r", encoding="utf-8", errors="replace") as f:
-            raw = f.read()
-    except Exception as e:
-        print(f"[File Error] Cannot read '{input_file_path}': {e}", file=sys.stderr)
+        with open(input_file_path, encoding="utf-8", errors="replace") as fh:
+            resume_text = fh.read()
+    except Exception as exc:
+        print(f"[File Error] Cannot read resume '{input_file_path}': {exc}")
         return SkillGapResult(gaps=[])
 
-    try:
-        resume_text = _sanitise(raw)
-    except ValueError as e:
-        print(e, file=sys.stderr)
+    # 2. Jailbreak check — runs BEFORE anything reaches an LLM
+    if _JAILBREAK_RE.search(resume_text):
+        print("[Security] Potentially malicious content detected in resume. Aborting.")
+        print("Example of what was blocked: 'ignore previous instructions', 'you are now', etc.")
         return SkillGapResult(gaps=[])
 
-    # 2. Load market skills from DB
-    try:
-        market_skills, skill_count = _load_market_skills(db_url)
-    except Exception as e:
-        print(f"[DB Error] {e}", file=sys.stderr)
-        return SkillGapResult(gaps=[])
+    # 3. Read tech stacks from DB via MCP (one fast query — time optimisation)
+    # BUG 5 FIX: use StdioTransport instead of passing a plain string to Client()
+    # BUG 6 FIX: pass db_url via DB_PATH env var (how db_server.py reads it).
+    # WINDOWS FIX: use sys.executable so the subprocess uses the exact venv Python;
+    # "python" is often not on PATH in a uv-managed environment on Windows.
+    import sys
+    os.environ["DB_PATH"] = db_url
 
-    if not market_skills:
-        print("[Warning] No tech stacks in DB. Run tag_data.py first.", file=sys.stderr)
-        return SkillGapResult(gaps=[])
-
-    # 3. Get Gemini client
-    try:
-        from google.genai import types
-        client = _get_client()
-    except Exception as e:
-        print(f"[Error] {e}", file=sys.stderr)
-        return SkillGapResult(gaps=[])
-
-    # 4. Ask Gemini to find skill gaps (with retry)
-    prompt = (
-        "You are a technical recruitment scanner. Find skill gaps.\n\n"
-        "Task: identify which Required Market Skills are MISSING from the Resume.\n"
-        "Rules:\n"
-        "- Output must be lowercase and sorted alphabetically.\n"
-        "- Ignore soft skills, languages, certifications.\n"
-        "- Be exact: if 'python' is in the resume, do NOT list it as a gap.\n"
-        "- Return only a JSON object with key 'gaps' containing a list of strings.\n\n"
-        f"Resume:\n{resume_text}\n\n"
-        f"Required Market Skills:\n{json.dumps(market_skills)}"
+    server_transport = StdioTransport(
+        command=sys.executable,
+        args=["db_server.py"],
     )
 
-    result_obj: SkillGapResult | None = None
-
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        try:
-            response = client.models.generate_content(
-                model=MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=SkillGapResult,
-                    temperature=0.0,  # determinism
-                ),
+    try:
+        async with Client(server_transport) as mcp:
+            result = await mcp.call_tool(
+                "query_db",
+                {
+                    "sql_query": (
+                        "SELECT tech_stack FROM jobs "
+                        "WHERE tech_stack IS NOT NULL AND TRIM(tech_stack) != ''"
+                    )
+                },
             )
-
-            if response.usage_metadata:
-                total_tokens += response.usage_metadata.total_token_count or 0
-            else:
-                total_tokens += len(prompt.split()) * 4 + len(response.text.split()) * 4
-
-            parsed = SkillGapResult.model_validate_json(response.text)
-            # Enforce lowercase + sorted regardless of what model returned
-            parsed.gaps = sorted(set(g.strip().lower() for g in parsed.gaps if g.strip()))
-            result_obj = parsed
-            break
-
-        except Exception as e:
-            print(f"Attempt {attempt} failed: {e}")
-            if attempt < MAX_ATTEMPTS:
-                print(f"Retrying in {RETRY_DELAY}s...")
-                time.sleep(RETRY_DELAY)
-
-    if result_obj is None:
+            raw_content = result[0].text if hasattr(result[0], "text") else str(result[0])
+            rows = json.loads(raw_content)
+    except Exception as exc:
+        print(f"[MCP Error] Cannot read tech stacks: {exc}")
         return SkillGapResult(gaps=[])
 
-    # 5. Compute demand statistics for gap skills
-    gap_demand = {g: skill_count.get(g, 0) for g in result_obj.gaps}
-    top5 = sorted(gap_demand, key=lambda k: gap_demand[k], reverse=True)[:5]
+    if not rows:
+        print("[Info] No tagged tech stacks in database. Run tag_data.py first.")
+        return SkillGapResult(gaps=[])
 
-    elapsed = (time.time() - start) * 1000
-    result_obj.tokens_used  = total_tokens
-    result_obj.elapsed_ms   = round(elapsed, 3)
-    result_obj.skill_demand  = gap_demand
-    result_obj.top_demanded  = top5
+    # 4. Build DB skill set and frequency map (pure Python, no LLM needed)
+    db_skill_freq = {}
+    for row in rows:
+        raw = row[0] if isinstance(row, (list, tuple)) else row["tech_stack"]
+        for token in _split_skills(raw):
+            db_skill_freq[token] = db_skill_freq.get(token, 0) + 1
 
-    return result_obj
+    all_db_skills = set(db_skill_freq.keys())
+
+    # 5. Extract resume skills (pure Python regex — fully deterministic)
+    resume_skills = _extract_resume_skills(resume_text)
+
+    # 6. Compute gaps — set difference, then sort (deterministic)
+    gaps = sorted(all_db_skills - resume_skills)
+
+    # 7. Statistics
+    gap_freq = {skill: db_skill_freq[skill] for skill in gaps}
+    top_5 = sorted(gap_freq, key=lambda k: gap_freq[k], reverse=True)[:5]
+    match_pct = round(
+        len(resume_skills & all_db_skills) / max(len(all_db_skills), 1) * 100, 1
+    )
+
+    elapsed = (time.perf_counter() - start) * 1000
+
+    result = SkillGapResult(
+        gaps=gaps,
+        total_skills_in_db=len(all_db_skills),
+        resume_skills_found=len(resume_skills & all_db_skills),
+        gap_count=len(gaps),
+        skill_frequency=gap_freq,
+        top_5_missing=top_5,
+        match_pct=match_pct,
+        tokens=0,
+        time_ms=round(elapsed, 3),
+    )
+    print(result)
+    return result
 
 
-# ── entry point ───────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _split_skills(raw: str) -> list:
+    """Split comma-separated tech_stack into clean lowercase tokens."""
+    return [t.strip().lower() for t in raw.split(",") if t.strip()]
+
+
+def _extract_resume_skills(text: str) -> set:
+    """
+    Deterministic regex-based resume skill extractor.
+    Splits on common delimiters, filters out long prose sentences.
+    """
+    text_lower = text.lower()
+    cleaned = re.sub(r"[•·|;]", ",", text_lower)
+    cleaned = re.sub(r"\n+", ",", cleaned)
+
+    skills = set()
+    for part in cleaned.split(","):
+        token = part.strip()
+        token = re.sub(r"^[\-\*\.\s]+", "", token).strip()
+        if not token:
+            continue
+        if len(token.split()) > 6:
+            continue
+        if len(token) > 40:
+            continue
+        skills.add(token)
+
+    # Also keep slash-separated tokens intact (e.g. "c/c++")
+    for part in re.split(r"[,\n•·|;]", text_lower):
+        token = re.sub(r"^[\-\*\.\s]+", "", part.strip()).strip()
+        if "/" in token and 0 < len(token) <= 40:
+            skills.add(token)
+
+    return skills
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    resume_path = sys.argv[1] if len(sys.argv) > 1 else "data/resume_d3.txt"
+    db_path = sys.argv[2] if len(sys.argv) > 2 else "data/jobs_d1.db"
+    find_skill_gaps(resume_path, db_path)
+
 
 if __name__ == "__main__":
-    resume_path = sys.argv[1] if len(sys.argv) > 1 else "data/resume.txt"
-    db_path     = sys.argv[2] if len(sys.argv) > 2 else "data/jobs_d1.db"
-
-    result = find_skill_gaps(resume_path, db_path)
-    print(result)
-    print(f"\ntime={result.elapsed_ms:.0f}ms tokens={result.tokens_used}")
-
-    if result.top_demanded:
-        print("\n📊 Top demanded skills you're missing:")
-        for skill in result.top_demanded:
-            print(f"  {skill:30s} — {result.skill_demand.get(skill, 0)} job(s)")
+    main()

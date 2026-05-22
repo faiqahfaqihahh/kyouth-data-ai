@@ -1,190 +1,229 @@
 """
-tag_data.py
+tag_data.py  (MCP edition)
 
-Reads untagged job rows from a SQLite database and uses Google Gemini to
-populate the tech_stack column with comma-separated technical skills.
-
-Usage:
-    uv run tag_data.py
-    uv run tag_data.py data/jobs_d1.db
+Populates the tech_stack column of untagged jobs using Gemini + FastMCP.
+Instead of running SQL directly, this script talks to db_server.py via
+the MCP protocol — Gemini decides which SQL tool to call and when.
 """
 
-import os
+import asyncio
+import json
 import sys
 import time
-import sqlite3
-import json
-from typing import List
-from pydantic import BaseModel
+import os
+
 from dotenv import load_dotenv
+from fastmcp import Client
+from fastmcp.client.transports import StdioTransport
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types as genai_types
+from pydantic import BaseModel, Field
 
 load_dotenv()
 
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
-# ── Pydantic models ───────────────────────────────────────────────────────────
+MODEL = "gemini-2.5-flash"
+BATCH_SIZE = 5          # rows per Gemini request  (5 RPM -> 1 req/12 s)
+RETRY_DELAY_S = 12      # seconds between batches
+MAX_RETRIES = 3
+
+# ---------------------------------------------------------------------------
+# Structured Output Schemas (Fixes JSON parsing errors and speeds up generation)
+# ---------------------------------------------------------------------------
 
 class JobTag(BaseModel):
-    source_id: str
-    tech_stack: str
+    index: int = Field(description="The index matching the job description order.")
+    tech_stack: str = Field(description="Comma-separated strings of the technical stack. Exclude soft skills.")
 
+class BatchResponse(BaseModel):
+    jobs: list[JobTag]
 
-class BatchTagResult(BaseModel):
-    jobs: List[JobTag]
+# ---------------------------------------------------------------------------
+# Quality measurement
+# ---------------------------------------------------------------------------
 
+def measure_quality(all_stacks: list) -> dict:
+    if not all_stacks:
+        return {}
 
-# ── configuration ─────────────────────────────────────────────────────────────
+    skill_lists = [
+        [s.strip().lower() for s in ts.split(",") if s.strip()]
+        for ts in all_stacks if ts
+    ]
+    flat = [s for sl in skill_lists for s in sl]
+    freq = {}
+    for s in flat:
+        freq[s] = freq.get(s, 0) + 1
 
-BATCH_SIZE   = 5     # jobs per API call
-MAX_ATTEMPTS = 3     # retries per batch
-RETRY_DELAY  = 2     # seconds between retries
-MODEL        = "gemini-2.5-flash"
+    duplicates = sum(1 for v in freq.values() if v > 1)
+    coverage = sum(1 for sl in skill_lists if sl) / max(len(all_stacks), 1) * 100
 
+    return {
+        "avg_stack_size": round(len(flat) / max(len(skill_lists), 1), 1),
+        "unique_skill_count": len(freq),
+        "duplicate_rate_pct": round(duplicates / max(len(freq), 1) * 100, 1),
+        "coverage_pct": round(coverage, 1),
+    }
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Main async function
+# ---------------------------------------------------------------------------
 
-def _get_client():
-    """Return a Gemini client, or raise RuntimeError with a clean message."""
-    from google import genai
-    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "API key not found. Set GOOGLE_API_KEY in your .env file."
-        )
-    return genai.Client(api_key=api_key)
+async def tag_data_async(db_url: str) -> tuple:
+    start = time.perf_counter()
+    total_tokens = 0
+    gemini = genai.Client()
 
+    # Safely pass DB_PATH to the background MCP server
+    mcp_env = os.environ.copy()
+    mcp_env["DB_PATH"] = db_url
 
-def _build_prompt(batch_data: list[dict]) -> str:
-    """Compact prompt – key token-saving choices:
-    - one-sentence role description
-    - data inlined as JSON (no per-job repetition of instructions)
-    - output schema stated once by example
-    """
-    return (
-        "Extract technical stack for each job. "
-        "Return ONLY valid JSON: {\"jobs\":[{\"source_id\":\"...\",\"tech_stack\":\"skill1, skill2\"},...]}. "
-        "No markdown, no explanation.\n\n"
-        f"Jobs: {json.dumps(batch_data)}"
+    # Force the background server to use your current virtual environment
+    server_transport = StdioTransport(
+        command=sys.executable,
+        args=["db_server.py"],
+        env=mcp_env
     )
 
+    async with Client(server_transport) as mcp:
+        # 1. Fetch untagged rows via MCP
+        try:
+            result = await mcp.call_tool(
+                "query_db",
+                {"sql_query": "SELECT source_id, description FROM jobs WHERE tech_stack IS NULL OR TRIM(tech_stack) = ''"}
+            )
+            raw_content = result[0].text if hasattr(result[0], "text") else str(result[0])
+            rows = json.loads(raw_content)
+        except Exception as exc:
+            print(f"[MCP Error] Could not fetch jobs: {exc}")
+            elapsed = (time.perf_counter() - start) * 1000
+            print(f"Total tokens used: 0, took {elapsed:.3f}ms")
+            return 0, elapsed
 
-# ── main function ─────────────────────────────────────────────────────────────
+        if not rows:
+            elapsed = (time.perf_counter() - start) * 1000
+            print("No data to tag")
+            print(f"Total tokens used: 0, took {elapsed:.3f}ms")
+            return 0, elapsed
 
-def tag_data(db_url: str) -> tuple[int, float]:
-    """
-    Populate the tech_stack column for all untagged jobs.
+        written_ids = set()
+        all_tagged_stacks = []
 
-    Parameters
-    ----------
-    db_url : str  – path to the SQLite database file
+        # 2. Process in batches
+        for batch_start in range(0, len(rows), BATCH_SIZE):
+            batch = rows[batch_start: batch_start + BATCH_SIZE]
+            tokens, results = await _process_batch(gemini, batch_start, batch)
+            total_tokens += tokens
 
-    Returns (total_tokens_used, elapsed_ms)
-    """
-    start = time.time()
-    total_tokens = 0
-
-    # ── connect to DB ─────────────────────────────────────────────────────────
-    try:
-        if not os.path.exists(db_url):
-            print(f"[Error] Database file not found: '{db_url}'", file=sys.stderr)
-            return 0, 0.0
-        conn = sqlite3.connect(db_url)
-        cursor = conn.cursor()
-    except Exception as e:
-        print(f"[DB Error] Cannot open '{db_url}': {e}", file=sys.stderr)
-        return 0, 0.0
-
-    # ── fetch untagged rows ───────────────────────────────────────────────────
-    try:
-        cursor.execute(
-            "SELECT source_id, description FROM jobs "
-            "WHERE tech_stack IS NULL OR tech_stack = ''"
-        )
-        untagged = cursor.fetchall()
-    except Exception as e:
-        print(f"[DB Error] Cannot query jobs: {e}", file=sys.stderr)
-        conn.close()
-        return 0, 0.0
-
-    if not untagged:
-        elapsed = (time.time() - start) * 1000
-        print("No data to tag")
-        print(f"Total tokens used: 0, took {elapsed:.3f}ms")
-        conn.close()
-        return 0, elapsed
-
-    # ── get Gemini client (once, fail fast with clean message) ────────────────
-    try:
-        from google.genai import types
-        client = _get_client()
-    except Exception as e:
-        print(f"[Error] {e}", file=sys.stderr)
-        conn.close()
-        return 0, 0.0
-
-    # ── process in batches ────────────────────────────────────────────────────
-    for batch_idx in range(0, len(untagged), BATCH_SIZE):
-        batch = untagged[batch_idx: batch_idx + BATCH_SIZE]
-        batch_data = [{"source_id": row[0], "description": row[1][:900]} for row in batch]
-        prompt = _build_prompt(batch_data)
-
-        result: BatchTagResult | None = None
-
-        for attempt in range(1, MAX_ATTEMPTS + 1):
-            try:
-                response = client.models.generate_content(
-                    model=MODEL,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=BatchTagResult,
-                        temperature=0.0,
-                    ),
-                )
-
-                # Token counting
-                if response.usage_metadata:
-                    total_tokens += response.usage_metadata.total_token_count or 0
-                else:
-                    total_tokens += len(prompt.split()) * 4 + len(response.text.split()) * 4
-
-                parsed = BatchTagResult.model_validate_json(response.text)
-
-                if len(parsed.jobs) != len(batch):
-                    raise ValueError(
-                        f"Mismatch between batch size ({len(batch)}) and response ({len(parsed.jobs)})"
+            for source_id, tech_stack in results:
+                if source_id in written_ids:
+                    continue
+                try:
+                    await mcp.call_tool(
+                        "execute_db",
+                        {
+                            "sql_query": "UPDATE jobs SET tech_stack = ? WHERE source_id = ?",
+                            "params": [tech_stack, source_id],
+                        },
                     )
+                    written_ids.add(source_id)
+                    all_tagged_stacks.append(tech_stack)
+                    print(f"Analyzed Job {source_id}: {tech_stack}")
+                except Exception as exc:
+                    print(f"[MCP Error] Failed to update job {source_id}: {exc}")
 
-                result = parsed
-                break  # success
+            # Keep requests paced within 5 RPM limits
+            if batch_start + BATCH_SIZE < len(rows):
+                await asyncio.sleep(RETRY_DELAY_S)
 
-            except Exception as e:
-                print(f"[Batch {batch_idx // BATCH_SIZE}] Attempt {attempt} failed: {e}")
-                if attempt < MAX_ATTEMPTS:
-                    time.sleep(RETRY_DELAY)
+        # 3. Quality report
+        quality = measure_quality(all_tagged_stacks)
+        if quality:
+            print("\n--- Tagging Quality Report ---")
+            print(f"  Coverage           : {quality['coverage_pct']}% of jobs tagged")
+            print(f"  Avg skills/job     : {quality['avg_stack_size']}")
+            print(f"  Unique skills      : {quality['unique_skill_count']}")
+            print(f"  Duplicate rate     : {quality['duplicate_rate_pct']}%")
 
-        if result is None:
-            print(f"[Batch {batch_idx // BATCH_SIZE}] Skipping after {MAX_ATTEMPTS} failed attempts")
-            continue
-
-        # Write to DB
-        for tagged in result.jobs:
-            if tagged.tech_stack:
-                cursor.execute(
-                    "UPDATE jobs SET tech_stack = ? WHERE source_id = ?",
-                    (tagged.tech_stack, tagged.source_id),
-                )
-                print(f"Analyzed Job {tagged.source_id}: {tagged.tech_stack}")
-
-        conn.commit()
-
-    conn.close()
-    elapsed = (time.time() - start) * 1000
+    elapsed = (time.perf_counter() - start) * 1000
     print(f"\nTotal tokens used: {total_tokens}, took {elapsed:.3f}ms")
     return total_tokens, elapsed
 
 
-# ── entry point ───────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Batch processor
+# ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+async def _process_batch(client, batch_idx: int, batch: list) -> tuple:
+    prompt_lines = []
+    for i, row in enumerate(batch):
+        source_id = row[0] if isinstance(row, (list, tuple)) else row["source_id"]
+        description = row[1] if isinstance(row, (list, tuple)) else row["description"]
+        prompt_lines.append(f"[{i}] Job {source_id}:\n{description}\n")
+
+    prompt = "\n".join(prompt_lines)
+    instruction = "Extract engineering skills, platforms, or tools from descriptions."
+    
+    current_delay = RETRY_DELAY_S
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = client.models.generate_content(
+                model=MODEL,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=instruction,
+                    temperature=0.0,
+                    response_mime_type="application/json",
+                    response_schema=BatchResponse,
+                ),
+            )
+
+            parsed_data = response.parsed
+            if not parsed_data or len(parsed_data.jobs) != len(batch):
+                raise ValueError(f"Mismatch: batch={len(batch)} vs response structure.")
+
+            results = []
+            for item in parsed_data.jobs:
+                row = batch[item.index]
+                source_id = row[0] if isinstance(row, (list, tuple)) else row["source_id"]
+                results.append((source_id, item.tech_stack))
+
+            tokens = 0
+            if response.usage_metadata:
+                tokens = (
+                    (response.usage_metadata.prompt_token_count or 0)
+                    + (response.usage_metadata.candidates_token_count or 0)
+                )
+
+            return tokens, results
+
+        except Exception as exc:
+            print(f"[Batch {batch_idx}] Attempt {attempt} failed: {exc}")
+            if attempt < MAX_RETRIES:
+                # Exponential backoff to safely clear Gemini 503 limits
+                print(f"Retrying in {current_delay}s...")
+                await asyncio.sleep(current_delay)
+                current_delay *= 2
+
+    print(f"[Batch {batch_idx}] All {MAX_RETRIES} attempts failed. Skipping.")
+    return 0, []
+
+
+# ---------------------------------------------------------------------------
+# Sync wrapper + entry point
+# ---------------------------------------------------------------------------
+
+def tag_data(db_url: str) -> tuple:
+    return asyncio.run(tag_data_async(db_url))
+
+def main() -> None:
     db_path = sys.argv[1] if len(sys.argv) > 1 else "data/jobs_d1.db"
     tag_data(db_path)
+
+if __name__ == "__main__":
+    main()

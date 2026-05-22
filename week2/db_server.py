@@ -1,61 +1,43 @@
-"""
-db_server.py  –  FastMCP server that exposes SQLite read/write operations.
-
-This file is launched as a subprocess by tag_data.py (MCP bonus).
-Do NOT run it directly.
-
-The DB path is passed as a command-line argument so the client
-can configure which database to use:
-    python db_server.py data/jobs_d1.db
-"""
-
-import sqlite3
-import sys
 from fastmcp import FastMCP
+import sqlite3
+import json
+import os
 
-DB_PATH = sys.argv[1] if len(sys.argv) > 1 else "data/jobs_d1.db"
+mcp = FastMCP("SQLite-Service")
 
-mcp = FastMCP("SQLite-Jobs-Service")
+# Read DB path from the environment variable set by tag_data.py
+DB_PATH = os.environ.get("DB_PATH", "data/jobs_d1.db")
 
-
-@mcp.tool
-def read_untagged_jobs() -> list[dict]:
-    """Return all jobs whose tech_stack column is NULL or empty."""
+@mcp.tool()  # <-- Added parentheses
+def query_db(sql_query: str) -> str:
+    """Executes a SELECT SQL query and returns results as a JSON string."""
     with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT source_id, description FROM jobs "
-            "WHERE tech_stack IS NULL OR tech_stack = ''"
-        )
-        return [dict(row) for row in cur.fetchall()]
+        cursor = conn.cursor()
+        cursor.execute(sql_query)
+        return json.dumps(cursor.fetchall())
 
-
-@mcp.tool
-def update_tech_stack(source_id: str, tech_stack: str) -> bool:
-    """Write a tech_stack string for one job row. Returns True on success."""
+@mcp.tool()  # <-- Added parentheses
+def execute_db(sql_query: str, params: list = None) -> str:
+    """Executes a write SQL query (INSERT/UPDATE/DELETE) with optional params."""
     with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE jobs SET tech_stack = ? WHERE source_id = ?",
-            (tech_stack, source_id),
-        )
+        cursor = conn.cursor()
+        if params:
+            cursor.execute(sql_query, params)
+        else:
+            cursor.execute(sql_query)
         conn.commit()
-        return cur.rowcount > 0
+        return json.dumps({"rowcount": cursor.rowcount})
 
-
-@mcp.tool
-def read_all_tech_stacks() -> list[dict]:
-    """Return source_id + tech_stack for all tagged rows."""
+@mcp.tool()  # <-- Added parentheses
+def get_tech_stacks() -> list:
+    """Retrieves all non-empty tech stacks from the database."""
     with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT source_id, tech_stack FROM jobs "
-            "WHERE tech_stack IS NOT NULL AND tech_stack != ''"
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT tech_stack FROM jobs WHERE tech_stack IS NOT NULL AND tech_stack != ''"
         )
-        return [dict(row) for row in cur.fetchall()]
-
+        rows = cursor.fetchall()
+    return [row[0] for row in rows]
 
 if __name__ == "__main__":
     mcp.run()

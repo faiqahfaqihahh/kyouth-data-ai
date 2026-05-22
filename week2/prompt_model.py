@@ -1,45 +1,71 @@
+import sys
+import subprocess
 import os
-import json
-import urllib.request
+from dotenv import load_dotenv
 from google import genai
-from google.genai import errors
 
-# Make sure you set your API key in your terminal before running!
-# export GEMINI_API_KEY="your_api_key_here"
+def main():
+    if len(sys.argv) < 3:
+        print("Usage: uv run prompt_model.py <model> <prompt>")
+        sys.exit(1)
 
-def prompt_model(model: str, prompt: str) -> str:
-    try:
-        if "gemini" in model.lower():
-            # Handle Google Gemini
-            client = genai.Client() # Automatically picks up GEMINI_API_KEY from environment
+    model = sys.argv[1]
+    prompt = sys.argv[2]
+
+    # Local Ollama models
+    if model.startswith("llama") or model.startswith("phi") or model.startswith("deepseek"):
+        try:
+            result = subprocess.run(
+                ["ollama", "run", model],
+                input=prompt,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace"
+            )
+
+            # ollama prints errors to stderr and exits with a non-zero code
+            if result.returncode != 0:
+                error_msg = result.stderr.strip() or result.stdout.strip()
+                print(f"Ollama error (exit code {result.returncode}): {error_msg}")
+                sys.exit(1)
+
+            if not result.stdout.strip():
+                print("Ollama returned an empty response. The model may have crashed.")
+                sys.exit(1)
+
+            print("\n--- RESPONSE ---\n")
+            print(result.stdout.strip())
+
+        except FileNotFoundError:
+            print("Error: 'ollama' command not found. Is Ollama installed and in your PATH?")
+            sys.exit(1)
+        except Exception as e:
+            print(f"Unexpected error running Ollama: {e}")
+            sys.exit(1)
+
+    # Gemini cloud models
+    else:
+        try:
+            load_dotenv()
+            api_key = os.getenv("GOOGLE_API_KEY")
+
+            if not api_key:
+                print("Error: GOOGLE_API_KEY not found in environment or .env file.")
+                sys.exit(1)
+
+            client = genai.Client(api_key=api_key)
+
             response = client.models.generate_content(
                 model=model,
                 contents=prompt
             )
-            return response.text
-        else:
-            # Handle Local Ollama
-            url = "http://127.0.0.1:11434/api/generate"
-            data = {
-                "model": model,
-                "prompt": prompt,
-                "stream": False
-            }
-            req = urllib.request.Request(url, json.dumps(data).encode('utf-8'), {'Content-Type': 'application/json'})
-            with urllib.request.urlopen(req) as response:
-                result = json.loads(response.read().decode())
-                return result['response']
-                
-    except Exception as e:
-        return f"[Error] Something went wrong: {str(e)}"
+            print("\n--- RESPONSE ---\n")
+            print(response.text.strip())
 
-# Main function to test it via command line arguments (Bonus)
+        except Exception as e:
+            print(f"Gemini error: {e}")
+            sys.exit(1)
+
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 2:
-        model_name = sys.argv[1]
-        user_prompt = sys.argv[2]
-        print("\n--- RESPONSE ---\n")
-        print(prompt_model(model_name, user_prompt))
-    else:
-        print("Usage: uv run prompt_model.py <model_name> '<prompt>'")
+    main()

@@ -1,13 +1,24 @@
 [project]
 name = "week-2"
 version = "0.1.0"
-description = "LLM tooling – prompt models, data tagging, skill gap analysis"
-requires-python = ">=3.11"
-
+requires-python = "==3.12.*"
 dependencies = [
-    "ollama>=0.5",
-    "google-genai>=1.0",
-    "pydantic>=2.0",
-    "python-dotenv>=1.0",
-    "fastmcp>=3.3",
+    "fastmcp==2.3.4",
+    "google-genai==1.16.0",
+    "ollama==0.4.8",
+    "pydantic==2.11.4",
+    "python-dotenv==1.1.0",
 ]
+
+
+[dependency-groups]
+dev = [
+    "ruff==0.11.2",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
