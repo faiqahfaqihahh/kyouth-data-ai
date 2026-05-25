@@ -1,0 +1,42 @@
+services:
+
+  backend:
+    build: ./backend
+    container_name: week3_backend
+    env_file: .env
+    ports:
+      - "8001:8001"
+    networks:
+      - app-net
+    restart: unless-stopped
+    healthcheck:
+      # Use Python (always present in the image) for a platform-independent check
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  frontend:
+    build: ./frontend
+    container_name: week3_frontend
+    environment:
+      - BACKEND_URL=http://backend:8001
+    ports:
+      - "8000:8000"
+    networks:
+      - app-net
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  app-net:
+    driver: bridge
