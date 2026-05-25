@@ -1,26 +1,4 @@
-# Virtual environments
+data/
+src/__pycache__/
+.ruff_cache/
 .venv/
-
-# Python cache
-__pycache__/
-*.pyc
-
-# Data directories (generated, not committed)
-data/1_bronze/
-data/2_silver/
-data/3_gold/
-
-# Environment variables
-.env
-*.env
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# IDE
-.vscode/
-.idea/
-
-# uv
-uv.lock
