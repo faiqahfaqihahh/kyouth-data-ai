@@ -35,13 +35,12 @@ def load_all_jsons(input_dir, output_dir):
             hash_input = f"{data['job_title']}|{data['company']}|{data['description']}"
             content_hash = hashlib.sha256(hash_input.encode()).hexdigest()
 
-            before_changes = conn.total_changes
             cursor.execute("""
                 INSERT OR IGNORE INTO job_listings (source_id, job_title, company, description, tech_stack, content_hash, quality)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (data["source_id"], data["job_title"], data["company"], data["description"], None, content_hash, None))
-            after_changes = conn.total_changes
-            if after_changes > before_changes:
+            
+            if cursor.rowcount > 0:
                 print(f"✅ Inserted: {json_file.name}")
                 logging.info(f"Inserted: {json_file.name}")
                 inserted += 1
