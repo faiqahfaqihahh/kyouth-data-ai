@@ -11,12 +11,6 @@ class JobListing(BaseModel):
     company: str
     description: str
 
-def decode_mhtml(raw_bytes: bytes) -> str:
-    try:
-        decoded_bytes = quopri.decodestring(raw_bytes)
-        return decoded_bytes.decode('utf-8', errors='ignore')
-    except Exception:
-        return raw_bytes.decode('utf-8', errors='ignore')
 
 def process_all_html(input_dir, output_dir): 
     input_dir = Path(input_dir)

@@ -6,6 +6,13 @@ def ingest_all_mhtml(input_dir, output_dir):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+def decode_mhtml(raw_bytes: bytes) -> str:
+    try:
+        decoded_bytes = quopri.decodestring(raw_bytes)
+        return decoded_bytes.decode('utf-8', errors='ignore')
+    except Exception:
+        return raw_bytes.decode('utf-8', errors='ignore')
+
     total, extracted, failed = 0, 0, 0
 
     for mhtml_file in input_dir.glob("*.mhtml"):

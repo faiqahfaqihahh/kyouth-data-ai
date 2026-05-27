@@ -1,2 +1,10 @@
-INSERT OR IGNORE INTO jobs (source_id, job_title, company, description, tech_stack, content_hash, quality)
+INSERT INTO job_listings (
+    source_id,
+    job_title,
+    company,
+    description,
+    tech_stack,
+    content_hash,
+    quality
+)
 VALUES (?, ?, ?, ?, ?, ?, ?);
