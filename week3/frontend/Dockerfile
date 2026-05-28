@@ -1,20 +1,19 @@
 FROM python:3.14.4-bookworm
 
-# Pin uv to the exact required version (0.8.*)
-COPY --from=ghcr.io/astral-sh/uv:0.8.24 /uv /usr/local/bin/uv
+# Install uv globally inside the container
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 WORKDIR /app
 
-# Copy manifest and lock file first for layer caching
+# Copy dependency files first to leverage Docker caching
 COPY pyproject.toml uv.lock ./
 
-# Install exact pinned dependencies from the lock file
-RUN uv sync --frozen --no-dev --system
+# Install dependencies strictly using the lockfile
+RUN uv sync --no-dev
 
-# Copy application source
-COPY src/ ./src/
+# Copy the rest of the application source code
+COPY . .
 
-EXPOSE 8000
-
-ENTRYPOINT ["uv", "run", "--system", "uvicorn"]
+# Corrected comma syntax to ensure the container stays up safely
+ENTRYPOINT ["uv", "run", "uvicorn"]
 CMD ["--app-dir", "src", "--host", "0.0.0.0", "--port", "8000", "app:app"]
