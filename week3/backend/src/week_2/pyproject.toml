@@ -1,0 +1,11 @@
+[project]
+name = "week-2"
+version = "0.1.0"
+description = "Job Skill Gap Analyser"
+requires-python = ">=3.12"
+dependencies = [
+    "fastmcp",
+    "google-genai",
+    "python-dotenv",
+    "pydantic",
+]
