@@ -10,3 +10,14 @@ dependencies = [
     "python-dotenv>=1.0.1",
     "google-genai>=2.7.0",
 ]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "S", "B", "A"]
+ignore = ["E501", "S101"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src"]

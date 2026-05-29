@@ -9,6 +9,19 @@ services:
     networks:
       - app-net
     restart: unless-stopped
+    healthcheck:
+      # Use Python (always present in the image) for a platform-independent check
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   frontend:
     build: ./frontend
@@ -20,7 +33,8 @@ services:
     networks:
       - app-net
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     restart: unless-stopped
 
 networks:
