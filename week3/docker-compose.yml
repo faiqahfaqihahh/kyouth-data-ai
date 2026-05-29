@@ -1,42 +1,36 @@
-services:
+version: '3.8'
 
+services:
   backend:
-    build: ./backend
-    container_name: week3_backend
-    env_file: .env
+    build:
+      context: ./backend
     ports:
       - "8001:8001"
+    environment:
+      - DB_URL=src/week_2/resources/jobs_d1.db
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
     networks:
-      - app-net
-    restart: unless-stopped
+      - app-network
     healthcheck:
-      # Use Python (always present in the image) for a platform-independent check
-      test:
-        [
-          "CMD",
-          "python",
-          "-c",
-          "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')",
-        ]
-      interval: 15s
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 5s
 
   frontend:
-    build: ./frontend
-    container_name: week3_frontend
-    environment:
-      - BACKEND_URL=http://backend:8001
+    build:
+      context: ./frontend
     ports:
       - "8000:8000"
-    networks:
-      - app-net
+    environment:
+      - BACKEND_URL=http://localhost:8001
     depends_on:
       backend:
         condition: service_healthy
-    restart: unless-stopped
+    networks:
+      - app-network
 
 networks:
-  app-net:
+  app-network:
     driver: bridge

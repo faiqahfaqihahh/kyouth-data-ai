@@ -9,11 +9,12 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 
 # Install dependencies strictly using the lockfile
-RUN uv sync --no-dev
+RUN uv sync --frozen --no-dev
 
 # Copy the rest of the application source code
 COPY . .
 
-# Corrected comma syntax to ensure the container stays up safely
-ENTRYPOINT ["uv", "run", "uvicorn"]
-CMD ["--app-dir", "src", "--host", "0.0.0.0", "--port", "8000", "app:app"]
+# Set up PATH to use the virtual environment
+ENV PATH="/app/.venv/bin:$PATH"
+
+CMD ["uvicorn", "--app-dir", "src", "--host", "0.0.0.0", "--port", "8000", "app:app"]

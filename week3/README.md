@@ -44,10 +44,10 @@ cd week_3
 cp .env.example .env
 ```
 
-Open `.env` and fill in your Anthropic API key:
+Open `.env` and fill in your Google Gemini API key:
 
 ```env
-ANTHROPIC_API_KEY=sk-ant-...
+Google Gemini-ant-...
 ```
 
 > **Never commit `.env` to version control.** It is listed in `.gitignore`.
