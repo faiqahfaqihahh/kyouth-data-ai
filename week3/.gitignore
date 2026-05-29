@@ -3,11 +3,19 @@
 .env.local
 .env.*.local
 
-# Python
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+
+# Distribution / packaging
 .Python
 build/
 develop-eggs/
@@ -28,12 +36,17 @@ share/python-wheels/
 *.egg
 MANIFEST
 
-# Virtual environments
-.venv/
-venv/
-ENV/
-env/
-.venv
+# Testing
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
 
 # IDEs
 .vscode/
@@ -43,26 +56,8 @@ env/
 *~
 .DS_Store
 
-# Testing & Coverage
-.pytest_cache/
-.coverage
-htmlcov/
-.tox/
-
-# Linting & Formatting
+# Ruff
 .ruff_cache/
-.mypy_cache/
-.dmypy.json
-dmypy.json
 
-# OS-specific
-Thumbs.db
-.DS_Store
-
-# Docker
-.docker/
-
-# Node (for frontend if needed)
-node_modules/
-npm-debug.log
-yarn-error.log
+# uv
+.uv/

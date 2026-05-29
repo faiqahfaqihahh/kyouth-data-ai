@@ -9,7 +9,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 
 # Install dependencies strictly using the lockfile
-RUN uv pip install -r pyproject.toml
+RUN uv sync
 
 # Transfer source directory files
 COPY . .
