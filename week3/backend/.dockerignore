@@ -1,0 +1,34 @@
+# Don't copy venv - Docker installs its own
+.venv/
+venv/
+
+# Don't expose secrets
+.env
+
+# Python cache - not needed in container
+__pycache__/
+*.pyc
+*.pyo
+
+# Git files - not needed in container
+.git/
+.gitignore
+
+# Documentation - not needed in container
+README.md
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Secrets never get baked into the image
+secrets/
+
+src/week_2/.venv/
+src/week_2/.env
+src/week_2/.gitignore
+src/week_2/rate_limit.txt
+src/week_2/data/

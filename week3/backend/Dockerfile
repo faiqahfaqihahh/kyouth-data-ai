@@ -5,11 +5,11 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 WORKDIR /app
 
-# Copy project config
-COPY pyproject.toml ./
+# Core Fix: Copy BOTH files so uv knows exactly what pinned packages to install
+COPY pyproject.toml uv.lock ./
 
-# Install dependencies and generate lock file
-RUN uv sync
+# Install dependencies strictly using the lockfile
+RUN uv pip install -r pyproject.toml
 
 # Transfer source directory files
 COPY . .

@@ -1,4 +1,4 @@
-# Week 3 — Full-Stack AI Chat (Microservices)
+# Week 3 : System Integration & Application
 
 A containerised, full-stack chat application built with **FastAPI**, **Jinja2**, **Uvicorn**, and the **Anthropic Claude API**. The system is split into two independent services orchestrated by Docker Compose.
 
