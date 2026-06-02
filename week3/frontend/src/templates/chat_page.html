@@ -135,7 +135,8 @@
                     headers: {
                         'Content-Type': 'application/json'
                     },
-                    body: JSON.stringify(payload)
+                    body: JSON.stringify(payload),
+                    signal: AbortSignal.timeout(120000) // 2 minute timeout
                 });
 
                 if (!response.ok) throw new Error(`HTTP network fault code: ${response.status}`);

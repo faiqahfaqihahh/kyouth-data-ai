@@ -17,4 +17,5 @@ COPY . .
 # Set up PATH to use the virtual environment
 ENV PATH="/app/.venv/bin:$PATH"
 
+ENTRYPOINT ["uv", "run" "uvicorn"]
 CMD ["uvicorn", "--app-dir", "src", "--host", "0.0.0.0", "--port", "8000", "app:app"]
